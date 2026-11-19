@@ -3,7 +3,11 @@
 // No git binary, no library: SHA-1 and zlib come from Node's stdlib.
 
 import { createHash } from 'node:crypto';
-import { deflateSync as zlibDeflate, inflateSync as zlibInflate } from 'node:zlib';
+import {
+  createInflate,
+  deflateSync as zlibDeflate,
+  inflateSync as zlibInflate,
+} from 'node:zlib';
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 
@@ -23,6 +27,10 @@ export function hashObject(type: GitObjectType, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
   return createHash('sha1').update(header).update(data).digest('hex');
 }
+
+/** Parsed commits and trees, memoized by their object bytes. Objects are immutable once stored, so a parse is a pure function of its bytes; the hot walks (fetch generation counts, ancestry checks, tree flattening) re-read the same objects hundreds of times. Callers only read the results, never mutate them. */
+const commitParseCache = new WeakMap<Buffer, ParsedCommit>();
+const treeParseCache = new WeakMap<Buffer, TreeEntry[]>();
 
 /** Build a tree object from entries, sorted the way git sorts them. */
 export interface TreeEntry {
@@ -47,6 +55,8 @@ export function buildTree(entries: readonly TreeEntry[]): Buffer {
 
 /** Parse a tree object's bytes into entries, in stored order. */
 export function parseTree(data: Buffer): TreeEntry[] {
+  const cached = treeParseCache.get(data);
+  if (cached) return cached;
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -59,6 +69,7 @@ export function parseTree(data: Buffer): TreeEntry[] {
     entries.push({ mode, name, oid });
     offset = nul + 21;
   }
+  treeParseCache.set(data, entries);
   return entries;
 }
 
@@ -72,6 +83,8 @@ export interface ParsedCommit {
 
 /** Parse a commit object's bytes. */
 export function parseCommit(data: Buffer): ParsedCommit {
+  const cached = commitParseCache.get(data);
+  if (cached) return cached;
   const text = data.toString('utf8');
   const head = text.split('\n\n')[0] ?? '';
   const message = text.includes('\n\n') ? text.slice(text.indexOf('\n\n') + 2) : '';
@@ -85,7 +98,9 @@ export function parseCommit(data: Buffer): ParsedCommit {
     else if (line.startsWith('author ')) author = line.slice(7);
     else if (line.startsWith('committer ')) committer = line.slice(10);
   }
-  return { tree, parents, author, committer, message };
+  const parsed = { tree, parents, author, committer, message };
+  commitParseCache.set(data, parsed);
+  return parsed;
 }
 
 /** Build a commit object's bytes. */
@@ -247,13 +262,40 @@ export interface ReadPackResult {
 }
 
 /**
+ * Inflate the zlib stream starting at `start` with one streaming pass and report exactly how many
+ * input bytes it consumed (the stream's bytesWritten is the count the engine took: it stops at the
+ * stream's end and never reads past it). One pass per object instead of the binary search below.
+ * Rejects when the stream does not inflate to `expectedSize`, so a wrong boundary falls back.
+ */
+function inflateStreamAt(pack: Buffer, start: number, expectedSize: number): Promise<{ data: Buffer; next: number }> {
+  const limit = pack.length - 20; // the 20-byte trailer is never part of a stream
+  return new Promise((resolve, reject) => {
+    const stream = createInflate();
+    const chunks: Buffer[] = [];
+    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => {
+      const data = Buffer.concat(chunks);
+      if (data.length !== expectedSize) {
+        reject(new Error('pack entry does not inflate to its declared size'));
+        return;
+      }
+      resolve({ data, next: start + stream.bytesWritten });
+    });
+    stream.write(pack.subarray(start, limit));
+    stream.end();
+  });
+}
+
+/**
  * Inflate the zlib stream starting at `start` and return its bytes plus the
  * offset just past the stream. Node's inflateSync ignores trailing bytes and
  * reports no consumed length, so the stream end is found by binary search:
  * a prefix shorter than the stream throws (or yields the wrong size), a
- * prefix at or past the end inflates to exactly `expectedSize`.
+ * prefix at or past the end inflates to exactly `expectedSize`. Kept as the
+ * fallback when the one-pass stream inflate above cannot run.
  */
-function inflateAt(pack: Buffer, start: number, expectedSize: number): { data: Buffer; next: number } {
+function inflateAtSync(pack: Buffer, start: number, expectedSize: number): { data: Buffer; next: number } {
   const limit = pack.length - 20; // the 20-byte trailer is never part of a stream
   const holds = (end: number): boolean => {
     try {
@@ -273,20 +315,29 @@ function inflateAt(pack: Buffer, start: number, expectedSize: number): { data: B
   return { data: zlibInflate(pack.subarray(start, low)), next: low };
 }
 
-/** Read a packfile: inflate every entry, resolve deltas, index by id. */
-export function readPack(pack: Buffer): ReadPackResult {
+type InflateAt = (
+  pack: Buffer,
+  start: number,
+  expectedSize: number,
+) => { data: Buffer; next: number } | Promise<{ data: Buffer; next: number }>;
+
+interface RawEntry {
+  readonly type: GitObjectType | 'ofs-delta' | 'ref-delta';
+  readonly data: Buffer;
+  readonly byteOffset: number;
+  readonly ofsBase?: number;
+  readonly refBase?: string;
+}
+
+/** A pack's raw entries plus the offset just past the last one. */
+async function parsePackEntries(
+  pack: Buffer,
+  inflateAtFn: InflateAt,
+): Promise<{ raw: RawEntry[]; endOffset: number }> {
   if (pack.length < 12 || pack.subarray(0, 4).toString('ascii') !== 'PACK') {
     throw new Error('not a packfile');
   }
-  const version = pack.readUInt32BE(4);
   const declaredCount = pack.readUInt32BE(8);
-  interface RawEntry {
-    readonly type: GitObjectType | 'ofs-delta' | 'ref-delta';
-    readonly data: Buffer;
-    readonly byteOffset: number;
-    readonly ofsBase?: number;
-    readonly refBase?: string;
-  }
   const raw: RawEntry[] = [];
   let deltaCount = 0;
   let offset = 12;
@@ -311,26 +362,34 @@ export function readPack(pack: Buffer): ReadPackResult {
         b = pack[offset++] ?? 0;
         baseOffset = ((baseOffset + 1) << 7) | (b & 0x7f);
       }
-      const inflated = inflateAt(pack, offset, size);
+      const inflated = await inflateAtFn(pack, offset, size);
       offset = inflated.next;
       raw.push({ type: 'ofs-delta', data: inflated.data, byteOffset: entryStart, ofsBase: entryStart - baseOffset });
       deltaCount += 1;
     } else if (typeCode === 7) {
       const refBase = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
-      const inflated = inflateAt(pack, offset, size);
+      const inflated = await inflateAtFn(pack, offset, size);
       offset = inflated.next;
       raw.push({ type: 'ref-delta', data: inflated.data, byteOffset: entryStart, refBase });
       deltaCount += 1;
     } else {
       const type = PACK_TYPE_NAMES[typeCode];
       if (!type) throw new Error(`unknown pack object type ${typeCode}`);
-      const inflated = inflateAt(pack, offset, size);
+      const inflated = await inflateAtFn(pack, offset, size);
       offset = inflated.next;
       if (inflated.data.length !== size) throw new Error('pack object size mismatch');
       raw.push({ type, data: inflated.data, byteOffset: entryStart });
     }
   }
+  return { raw, endOffset: offset };
+}
+
+/** Resolve raw entries (plain objects first, then deltas) and verify the trailer checksum. */
+function resolvePackEntries(pack: Buffer, raw: readonly RawEntry[]): ReadPackResult {
+  const declaredCount = pack.readUInt32BE(8);
+  const version = pack.readUInt32BE(4);
+  const deltaCount = raw.filter((entry) => entry.type === 'ofs-delta' || entry.type === 'ref-delta').length;
   // Resolve: plain objects first, then deltas (a delta's base may itself be a delta).
   const byByteOffset = new Map<number, RawEntry>();
   for (const entry of raw) byByteOffset.set(entry.byteOffset, entry);
@@ -370,6 +429,22 @@ export function readPack(pack: Buffer): ReadPackResult {
   const expected = createHash('sha1').update(pack.subarray(0, pack.length - 20)).digest('hex');
   if (trailer !== expected) throw new Error('pack trailer checksum mismatch');
   return { objects: resolved, deltaCount, declaredCount, version };
+}
+
+/**
+ * Read a packfile: inflate every entry, resolve deltas, index by id. The one-pass stream inflate
+ * runs first; anything it gets wrong (a short read, a misaligned end offset) falls back to the
+ * binary-search inflate, so a stream quirk can only cost time, never a wrong pack.
+ */
+export async function readPack(pack: Buffer): Promise<ReadPackResult> {
+  try {
+    const { raw, endOffset } = await parsePackEntries(pack, inflateStreamAt);
+    if (endOffset !== pack.length - 20) throw new Error('pack entries do not end at the trailer');
+    return resolvePackEntries(pack, raw);
+  } catch {
+    const { raw } = await parsePackEntries(pack, inflateAtSync);
+    return resolvePackEntries(pack, raw);
+  }
 }
 
 /** Write a packfile (v2, plain objects only, no deltas). */
@@ -440,18 +515,24 @@ export function collectReachable(tips: Iterable<string>, lookup: ObjectLookup): 
   return seen;
 }
 
-/** The commits reachable from `tips`, with their generation (distance from a tip). */
-export function commitGenerations(tips: readonly string[], lookup: ObjectLookup): Map<string, number> {
+/** The commits reachable from `tips`, with their generation (distance from a tip). `maxDepth` caps the walk: a shallow fetch only needs the generations below its depth, so a depth-1 clone of a 200-commit history walks one commit instead of two hundred. */
+export function commitGenerations(
+  tips: readonly string[],
+  lookup: ObjectLookup,
+  maxDepth = Number.POSITIVE_INFINITY,
+): Map<string, number> {
   const generations = new Map<string, number>();
   const queue: Array<{ oid: string; gen: number }> = tips.map((oid) => ({ oid, gen: 0 }));
-  while (queue.length) {
-    const { oid, gen } = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const { oid, gen } = queue[head++]!;
     if (oid === ZERO_OID) continue;
     const known = generations.get(oid);
     if (known !== undefined && known <= gen) continue;
     const object = lookup(oid);
     if (!object || object.type !== 'commit') continue;
     generations.set(oid, gen);
+    if (gen + 1 >= maxDepth) continue;
     for (const parent of parseCommit(object.data).parents) {
       queue.push({ oid: parent, gen: gen + 1 });
     }

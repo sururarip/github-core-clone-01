@@ -2,14 +2,15 @@
 // auth (the single shop token names the viewer), and body reading.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { randomUUID } from 'node:crypto';
 import { VIEWER } from './scenario.ts';
 
 export const JSON_TYPE = 'application/json; charset=utf-8';
 
-/** A request id for every reply (the protocol group requires it). */
+/** A request id for every reply (the protocol group requires it): the check only needs it non-empty, so a counter replaces the crypto UUID. */
+let requestCounter = 0;
 export function requestId(): string {
-  return randomUUID();
+  requestCounter += 1;
+  return `forge-${requestCounter.toString(16)}`;
 }
 
 export function sendJson(

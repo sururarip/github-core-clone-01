@@ -248,7 +248,7 @@ export function computeFetch(
     }
     unshallow = [...priorShallow];
   } else {
-    const generations = commitGenerations(peeledWants, lookup);
+    const generations = commitGenerations(peeledWants, lookup, depth);
     const included = new Set<string>();
     for (const [oid, gen] of generations) {
       if (gen < depth && !haveSet.has(oid)) included.add(oid);
@@ -399,7 +399,7 @@ interface PushCommand {
 }
 
 /** Handle a receive-pack (push) request body. */
-function handleReceivePack(repo: Repo, body: Buffer): Buffer {
+async function handleReceivePack(repo: Repo, body: Buffer): Promise<Buffer> {
   let commands: PushCommand[] = [];
   let packBytes = Buffer.alloc(0);
   // Parse pkt-lines one at a time from the start; the pack begins right
@@ -444,7 +444,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
     const needsPack = commands.some((command) => command.newOid !== ZERO_OID);
     if (needsPack && packBytes.length > 0) {
       try {
-        const read = readPack(packBytes);
+        const read = await readPack(packBytes);
         for (const [oid, object] of read.objects) {
           if (!repo.objects.has(oid)) repo.objects.set(oid, object);
         }
@@ -584,7 +584,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, store
       return true;
     }
     try {
-      sendBuffer(res, 200, handleReceivePack(repo, body), RECEIVE_RESULT);
+      sendBuffer(res, 200, await handleReceivePack(repo, body), RECEIVE_RESULT);
     } catch {
       sendJson(res, 400, { message: 'malformed git request' });
     }
